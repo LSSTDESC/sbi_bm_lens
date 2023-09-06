@@ -36,7 +36,6 @@ class SNLE:
         return -jnp.mean(lp)
 
     def _check_cvg(self, epoch, val_log_prob):
-        # (this function is from https://github.com/mackelab/sbi)
         converged = False
 
         if epoch == 0 or val_log_prob < self._best_val_log_prob:
@@ -130,7 +129,7 @@ class SNLE:
                 print("/!\ NaN in training")
                 break
 
-            if batch % (nb_simu // batch_size) == 0:
+            if nb_simu // batch_size == 0 or batch % (nb_simu // batch_size) == 0:
                 batch_loss.append(l)
 
                 if self._check_cvg(epoch, batch_loss[-1]):

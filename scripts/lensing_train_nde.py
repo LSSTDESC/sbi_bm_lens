@@ -23,10 +23,10 @@ from sbi_lens.normflow.models import (
 )
 from tqdm import tqdm
 
-from sbiax.nn import MomentNetwork
-from sbiax.inference.snle import SNLE
-from sbiax.utils import make_plot
-from sbiax.simulators.lensing_simulator_utils import CompressedSimulator
+from nn import MomentNetwork
+from snle import SNLE
+from utils import make_plot
+from lensing_simulator_utils import CompressedSimulator
 from sbi_lens.simulator.LogNormal_field import lensingLogNormal
 
 tfp = tfp.experimental.substrates.jax
@@ -58,10 +58,10 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--exp_id", type=str, default="job_0")
 parser.add_argument("--bacth_size", type=int, default=80)
 
-parser.add_argument("--score_weight", type=float, default=1e-4)
+parser.add_argument("--score_weight", type=float, default=0)
 
-parser.add_argument("--score", type=str, default="marginal")
-parser.add_argument("--score_noise", type=float, default=1e-4)
+parser.add_argument("--score", type=str, default="unmarginal")
+parser.add_argument("--score_noise", type=float, default=0)
 
 args = parser.parse_args()
 
@@ -288,6 +288,9 @@ print("... inference")
 
 N = args.nb_round
 
+if N > 1:
+    nb_simulations_allow = nb_simulations_allow // N
+
 params_init = nf_log_prob.init(
     master_seed, 0.5 * jnp.ones([1, dim]), 0.5 * jnp.ones([1, dim])
 )
@@ -326,9 +329,9 @@ if args.score == "marginal":
         params_esperance, state_bn, data["theta"], data["y"]
     )
 
-    learned_marginal_score = learned_marginal_score * (
-        1
-        + args.score_noise
+    learned_marginal_score += (
+        learned_marginal_score
+        * args.score_noise
         * np.random.normal(0.0, 1.0, size=learned_marginal_score.shape)
     )
 
@@ -344,7 +347,7 @@ for round in range(N):
     inference.train(
         data,
         round_number=round,
-        batch_size=args.bacth_size,
+        batch_size=batch_size,
         score_weight=args.score_weight,
         learning_rate=1e-4,
     )
@@ -365,7 +368,7 @@ for round in range(N):
         )
 
         if args.score == "marginal":
-            learned_marginal_score = get_moments_fixed.apply(
+            learned_marginal_score, _ = get_moments_fixed.apply(
                 params_esperance, state_bn, data["theta"], data["y"]
             )
 
