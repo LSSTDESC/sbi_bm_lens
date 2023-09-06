@@ -12,7 +12,7 @@ setup(
     },
     include_package_data=True,
     install_requires=[
-        "sbi_lens",
+        "git+https://github.com/DifferentiableUniverseInitiative/sbi_lens.git",
         "numpy>=1.22.4,<1.24",
         "jax>=0.4.1",
         "tensorflow_probability>=0.19.0",
