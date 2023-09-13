@@ -1,1 +1,1 @@
-# sbi_jax
+# sbi_bm_lens
