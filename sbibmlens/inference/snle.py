@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import optax
 import tensorflow_probability as tfp
 import numpy as np
+from tqdm import tqdm
 
 tfp = tfp.experimental.substrates.jax
 
@@ -10,15 +11,13 @@ tfp = tfp.experimental.substrates.jax
 class SNLE:
     def __init__(self, NDE, init_params_nde, dim):
         self.NDE = NDE
-        self.data = {}
-        self.params_nde = init_params_nde
+        self.params = init_params_nde
         self.dim = dim
-        self.loss_all_round = []
 
     def log_prob_fn(self, params, theta, y):
         return self.NDE.apply(params, theta, y)
 
-    def _loss_nll_and_score(self, params, mu, batch, score, score_weight):
+    def loss_nll_and_score(self, params, mu, batch, score, weight_score):
         lp, out = jax.vmap(
             jax.value_and_grad(
                 lambda theta, x: self.log_prob_fn(
@@ -28,138 +27,84 @@ class SNLE:
         )(mu, batch)
 
         return (
-            -jnp.mean(lp) + score_weight * jnp.sum((out - score) ** 2, axis=-1).mean()
+            -jnp.mean(lp) + weight_score * jnp.sum((out - score) ** 2, axis=-1).mean()
         )
 
-    def _loss_nll(self, params, mu, batch, score, score_weight):
+    def loss_nll(self, params, mu, batch, score, weight_score):
         lp = self.log_prob_fn(params, mu, batch)
+
         return -jnp.mean(lp)
 
-    def _check_cvg(self, epoch, val_log_prob):
-        converged = False
-
-        if epoch == 0 or val_log_prob < self._best_val_log_prob:
-            self._best_val_log_prob = val_log_prob
-            self._epochs_since_last_improvement = 0
-        else:
-            self._epochs_since_last_improvement += 1
-
-        # If no validation improvement over many epochs, stop training.
-        if self._epochs_since_last_improvement > 200:
-            converged = True
-
-        return converged
-
     def train(
-        self,
-        dataset,
-        score_weight=0,
-        round_number=0,
-        learning_rate=1e-3,
-        batch_size=128,
-        max_iter=1e4,
+        self, data, learning_rate, total_steps=30_000, batch_size=128, score_weight=0
     ):
-        self.round_number = round_number
-
-        mu = dataset["theta"]
-        batch = dataset["y"]
+        dataset_theta = data["theta"]
+        dataset_y = data["y"]
         if score_weight != 0:
-            score = dataset["score"]
-            loss_fn = self._loss_nll_and_score
+            dataset_score = data["score"]
+            loss_fn = self.loss_nll_and_score
         else:
-            score = None
-            loss_fn = self._loss_nll
+            loss_fn = self.loss_nll
 
-        if round_number > 0:
-            self.data["theta"] = jnp.concatenate([self.data["theta"], mu], axis=0)
-            self.data["y"] = jnp.concatenate([self.data["y"], batch], axis=0)
-            if score_weight != 0:
-                self.data["score"] = jnp.concatenate(
-                    [self.data["score"], score], axis=0
-                )
-        else:
-            self.data["theta"] = mu
-            self.data["y"] = batch
-            if score_weight != 0:
-                self.data["score"] = score
-
-        nb_simu = len(self.data["theta"])
+        nb_simu = len(dataset_theta)
 
         print("nb of simulations used for training: ", nb_simu)
 
+        params = self.params
         optimizer = optax.adam(learning_rate)
+        opt_state = optimizer.init(params)
 
         @jax.jit
-        def update(params, opt_state, mu, batch, score, score_weight):
+        def update(params, opt_state, mu, batch, score, weight_score):
             """Single SGD update step."""
             loss, grads = jax.value_and_grad(loss_fn)(
-                params, mu, batch, score, score_weight
+                params, mu, batch, score, weight_score
             )
             updates, new_opt_state = optimizer.update(grads, opt_state, params)
             new_params = optax.apply_updates(params, updates)
 
             return loss, new_params, new_opt_state
 
-        params_nde = self.params_nde
-        opt_state = optimizer.init(params_nde)
+        print("... start training")
 
         batch_loss = []
+        lr_scheduler_store = []
+        pbar = tqdm(range(total_steps))
 
-        keep_going = True
-        epoch = 0
-        batch = 0
-
-        print("... training nde")
-        while keep_going and epoch < max_iter:
+        for batch in pbar:
             inds = np.random.randint(0, nb_simu, batch_size)
-            ex_theta = self.data["theta"][inds]
-            ex_y = self.data["y"][inds]
+            ex_theta = dataset_theta[inds]
+            ex_y = dataset_y[inds]
             if score_weight != 0:
-                ex_score = self.data["score"][inds]
+                ex_score = dataset_score[inds]
             else:
                 ex_score = None
 
-            batch += 1
+            if not jnp.isnan(ex_y).any():
+                l, params, opt_state = update(
+                    params, opt_state, ex_theta, ex_y, ex_score, score_weight
+                )
 
-            l, params_nde, opt_state = update(
-                params_nde, opt_state, ex_theta, ex_y, ex_score, score_weight
-            )
-
-            if jnp.isnan(l):
-                print("/!\ NaN in training")
-                break
-
-            if nb_simu // batch_size == 0 or batch % (nb_simu // batch_size) == 0:
                 batch_loss.append(l)
+                pbar.set_description(f"loss {l:.3f}")
 
-                if self._check_cvg(epoch, batch_loss[-1]):
-                    keep_going = False
-                else:
-                    keep_going = True
+                if jnp.isnan(l):
+                    break
 
-                epoch += 1
+        self.params = params
+        self.loss = batch_loss
 
-        print("nb of epoch: ", epoch)
-        print("... done ✓")
-
-        self.loss = jnp.array(batch_loss)
-
-        if self.round_number == 0:
-            self.loss_all_round = self.loss
-        else:
-            self.loss_all_round = jnp.concatenate([self.loss_all_round, self.loss])
-
-        self.params_nde = params_nde
+        print("done ✓")
 
     def sample(
         self,
         log_prob_prior,
-        init,
         observation,
-        seed,
-        num_chains=5,
-        num_results=1e4,
+        init_point,
+        key,
+        num_results=3e4,
         num_burnin_steps=5e2,
+        num_chains=12,
     ):
         print("... running hmc")
 
@@ -168,7 +113,7 @@ class SNLE:
             prior = log_prob_prior(theta)
 
             likelihood = self.log_prob_fn(
-                self.params_nde,
+                self.params,
                 theta.reshape([1, self.dim]),
                 jnp.array(observation).reshape([1, self.dim]),
             )
@@ -192,10 +137,10 @@ class SNLE:
             samples, is_accepted = tfp.mcmc.sample_chain(
                 num_results=num_results,
                 num_burnin_steps=num_burnin_steps,
-                current_state=init * jnp.ones([num_chains, self.dim]),
+                current_state=jnp.array(init_point) * jnp.ones([num_chains, self.dim]),
                 kernel=adaptive_hmc,
                 trace_fn=lambda _, pkr: pkr.inner_results.is_accepted,
-                seed=seed,
+                seed=key,
             )
 
             return samples, is_accepted
@@ -203,8 +148,6 @@ class SNLE:
         samples_hmc, is_accepted_hmc = run_chain()
         sample_nd = samples_hmc[is_accepted_hmc]
 
-        print("... done ✓")
-
-        self.posterior_samples = sample_nd
+        print("done ✓")
 
         return sample_nd

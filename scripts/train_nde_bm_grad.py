@@ -13,7 +13,6 @@ import numpyro.distributions as dist
 import optax
 import tensorflow as tf
 import tensorflow_probability as tfp
-from chainconsumer import ChainConsumer
 from haiku._src.nets.resnet import ResNet18
 from sbi_lens.config import config_lsst_y_10
 from sbi_lens.normflow.models import (
@@ -21,13 +20,14 @@ from sbi_lens.normflow.models import (
     AffineCoupling,
     ConditionalRealNVP,
 )
-from tqdm import tqdm
 
-from nn import MomentNetwork
-from snle import SNLE
-from utils import make_plot
-from lensing_simulator_utils import CompressedSimulator
+from sbibmlens.nn import MomentNetwork
+from sbibmlens.inference.snle import SNLE
+from sbibmlens.utils import make_plot
+from sbibmlens.simulator.lensing_simulator import CompressedSimulator
+
 from sbi_lens.simulator.LogNormal_field import lensingLogNormal
+from sbi_lens.metrics.c2st import c2st
 
 tfp = tfp.experimental.substrates.jax
 tfb = tfp.bijectors
@@ -57,6 +57,7 @@ parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--exp_id", type=str, default="job_0")
 parser.add_argument("--bacth_size", type=int, default=80)
+parser.add_argument("--total_steps", type=int, default=70_000)
 
 parser.add_argument("--score_weight", type=float, default=0)
 
@@ -70,7 +71,7 @@ print("PARAMS---------------")
 print("---------------------")
 
 batch_size = args.bacth_size
-tmp = [100, 200, 300, 400, 600, 1000]
+tmp = [100, 200, 300, 400, 600, 800, 1000, 1500, 2000]  # range(100,1100,100)
 nb_simulations_allow = tmp[int(args.exp_id[4:])]
 
 
@@ -82,19 +83,18 @@ print("n_flow_layers:", args.n_flow_layers)
 print("n_bijector_layers:", args.n_bijector_layers)
 print("activ_fun:", args.activ_fun)
 print("sbi method:", args.sbi_method)
-print("nb rounds:", args.nb_round)
 print("nf type:", args.nf)
 print("batch size:", args.bacth_size)
 print("score type:", args.score)
 print("score noise:", args.score_noise)
+print("total_steps:", args.total_steps)
 
 print("---------------------")
 print("---------------------")
 
 PATH = "_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}".format(
     args.sbi_method,
-    args.nb_round,
-    args.score_weight,
+    args.total_steps,
     nb_simulations_allow,
     args.seed,
     args.n_flow_layers,
@@ -102,6 +102,7 @@ PATH = "_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}".format(
     args.activ_fun,
     args.nf,
     args.bacth_size,
+    args.score_weight,
     args.score,
     args.score_noise,
 )
@@ -188,6 +189,7 @@ m_data_comressed, _ = compressor.apply(
 
 print("done ✓")
 
+
 ######## SET UP SIMULATOR ########
 print("... set up simulator")
 
@@ -217,7 +219,15 @@ elif args.activ_fun == "sin":
 
 if args.nf == "smooth":
     if args.sbi_method == "npe":
-        theta = compressed_simulator.prior_sample((1000,), master_seed)
+        key = jax.random.PRNGKey(0)
+        omega_c = dist.TruncatedNormal(0.2664, 0.2, low=0).sample(key, (1000,))
+        omega_b = dist.Normal(0.0492, 0.006).sample(key, (1000,))
+        sigma_8 = dist.Normal(0.831, 0.14).sample(key, (1000,))
+        h_0 = dist.Normal(0.6727, 0.063).sample(key, (1000,))
+        n_s = dist.Normal(0.9645, 0.08).sample(key, (1000,))
+        w_0 = dist.TruncatedNormal(-1.0, 0.9, low=-2.0, high=-0.3).sample(key, (1000,))
+
+        theta = jnp.stack([omega_c, omega_b, sigma_8, h_0, n_s, w_0], axis=-1)
 
         scale = jnp.std(theta, axis=0) / 0.07
         shift = jnp.mean(theta / scale, axis=0) - 0.5
@@ -283,19 +293,26 @@ elif args.sbi_method == "nle":
 
 print("done ✓")
 
+
 ######## INFERENCE ########
 print("... inference")
-
-N = args.nb_round
-
-if N > 1:
-    nb_simulations_allow = nb_simulations_allow // N
 
 params_init = nf_log_prob.init(
     master_seed, 0.5 * jnp.ones([1, dim]), 0.5 * jnp.ones([1, dim])
 )
 
-init_mcmc = jnp.array(jnp.mean(compressed_simulator.prior_sample((1000,), master_seed)))
+prior_mean = jnp.mean(compressed_simulator.prior_sample((1000,), master_seed), axis=0)
+
+
+nb_steps = args.total_steps - args.total_steps * 0.2
+
+lr_scheduler = optax.exponential_decay(
+    init_value=0.001,
+    transition_steps=nb_steps // 50,
+    decay_rate=0.9,
+    end_value=1e-5,
+)
+
 
 if args.sbi_method == "nle":
     inference = SNLE(NDE=nf_log_prob, init_params_nde=params_init, dim=6)
@@ -308,6 +325,7 @@ data = compressed_simulator.build_dataset(
     use_prior=True,
     proposal_sample=None,
 )
+
 
 if args.score == "marginal":
     nb_layer = 2
@@ -341,80 +359,67 @@ if args.score == "marginal":
         "y": data["y"],
     }
 
-for round in range(N):
-    key1, key2, master_seed = jax.random.split(master_seed, 3)
 
-    inference.train(
-        data,
-        round_number=round,
-        batch_size=batch_size,
-        score_weight=args.score_weight,
-        learning_rate=1e-4,
-    )
+inference.train(
+    data,
+    total_steps=args.total_steps,
+    batch_size=args.bacth_size,
+    score_weight=args.score_weight,
+    learning_rate=lr_scheduler,
+)
 
-    posterior_sample = inference.sample(
-        log_prob_prior=compressed_simulator.prior_log_prob,
-        init=init_mcmc,
-        observation=m_data_comressed,
-        seed=key2,
-    )
 
-    if round != N - 1:
-        data = compressed_simulator.build_dataset(
-            batch_size=nb_simulations_allow,
-            seed=key1,
-            use_prior=False,
-            proposal_sample=posterior_sample,
-        )
+posterior_sample = inference.sample(
+    log_prob_prior=compressed_simulator.prior_log_prob,
+    observation=m_data_comressed,
+    init_point=prior_mean,
+    key=master_seed,
+)
 
-        if args.score == "marginal":
-            learned_marginal_score, _ = get_moments_fixed.apply(
-                params_esperance, state_bn, data["theta"], data["y"]
-            )
+jnp.save(
+    f"./results/experiments/exp{PATH}/posteriors_sample",
+    posterior_sample,
+)
 
-            learned_marginal_score += (
-                learned_marginal_score
-                * args.score_noise
-                * np.random.normal(0.0, 1.0, size=learned_marginal_score.shape)
-            )
+make_plot(
+    [sample_ff, posterior_sample],
+    [
+        "Ground truth",
+        "Approx w/ {} sim, {} score weight, {} score type, {} noise score".format(
+            nb_simulations_allow, args.score_weight, args.score, args.score_noise
+        ),
+    ],
+    params_name,
+    truth,
+)
 
-            data = {
-                "theta": data["theta"],
-                "score": learned_marginal_score,
-                "y": data["y"],
-            }
+plt.savefig(f"./results/experiments/exp{PATH}/fig/contour_plot_round{0}")
 
-    make_plot(
-        [sample_ff, posterior_sample],
-        ["Ground truth", "Approx round n: {}".format(round)],
-        params_name,
-        truth,
-    )
+print("done ✓")
 
-    plt.savefig(f"./results/experiments/exp{PATH}/fig/contour_plot_round{round}")
+print("... compute metric")
 
-params_nde = inference.params_nde
-loss = inference.loss_all_round
+if len(posterior_sample) > len(sample_ff):
+    nb_posterior_sample = len(sample_ff)
+else:
+    nb_posterior_sample = len(posterior_sample)
+
+inds = np.random.randint(0, nb_posterior_sample, 10_000)
+c2st_metric = c2st(sample_ff[inds], posterior_sample[inds], seed=0, n_folds=5)
+
+print("done ✓")
 
 print("... save info, params, etc.")
 
 # save params
+
+params_nde = inference.params
 with open(
     f"./results/experiments/exp{PATH}/save_params/params_flow.pkl",
     "wb",
 ) as fp:
     pickle.dump(params_nde, fp)
 
-# save plot loss
-plt.figure()
-plt.plot(loss[10:])
-plt.title("Batch Loss")
-plt.savefig(f"./results/experiments/exp{PATH}/fig/loss")
-
-jnp.save(
-    f"./results/experiments/exp{PATH}/posteriors_sample",
-    posterior_sample,
-)
 
 print("done ✓")
 
@@ -423,6 +428,7 @@ print("... save info experiment")
 field_names = [
     "experiment_id",
     "sbi_method",
+    "total_steps",
     "activ_fun",
     "nb_simulations",
     "score_weight",
@@ -433,12 +439,13 @@ field_names = [
     "batch size",
     "score type",
     "score noise",
-    "nb_round",
+    "c2st",
 ]
+
 dict = {
     "experiment_id": f"exp{PATH}",
     "sbi_method": args.sbi_method,
-    "nb_round": args.nb_round,
+    "total_steps": args.total_steps,
     "activ_fun": args.activ_fun,
     "nb_simulations": nb_simulations_allow,
     "score_weight": args.score_weight,
@@ -449,6 +456,7 @@ dict = {
     "batch size": args.bacth_size,
     "score type": args.score,
     "score noise": args.score_noise,
+    "c2st": c2st_metric,
 }
 
 with open(
