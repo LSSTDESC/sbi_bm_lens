@@ -29,11 +29,6 @@ from tqdm import tqdm
 from sbibmlens.simulator.lensing_simulator import CompressedSimulator
 from sbibmlens.utils import make_plot
 
-from sbibmlens.simulator.torch_lensing_simulator import (
-    PytorchCompressedSimulator,
-    PytorchPrior,
-)
-
 
 # script arguments
 parser = argparse.ArgumentParser()
