@@ -68,7 +68,7 @@ os.makedirs(f"./results/experiments_sbi/exp{PATH}/save_params")
 os.makedirs(f"./results/experiments_sbi/exp{PATH}/fig")
 
 
-nb_posterior_sample = 1000
+nb_posterior_sample = 100
 num_chains = 20
 
 nb_simulations_allow_per_round = nb_simulations_allow // args.nb_round
@@ -213,6 +213,7 @@ elif args.sbi_method == "snre":
     )
 
 
+posterior_sample = jnp.array(posterior_sample)
 jnp.save(
     f"./results/experiments_sbi/exp{PATH}/posteriors_sample",
     posterior_sample,
@@ -241,19 +242,6 @@ c2st_metric = c2st(sample_ff[inds], posterior_sample[inds], seed=0, n_folds=5)
 
 print("done ✓")
 
-print("... save info, params, etc.")
-
-# save params
-
-params_nde = inference.params
-with open(
-    f"./results/experiments_sbi/exp{PATH}/save_params/params_flow.pkl",
-    "wb",
-) as fp:
-    pickle.dump(params_nde, fp)
-
-
-print("done ✓")
 
 print("... save info experiment")
 
