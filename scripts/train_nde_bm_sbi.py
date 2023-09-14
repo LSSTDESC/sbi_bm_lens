@@ -68,7 +68,7 @@ os.makedirs(f"./results/experiments_sbi/exp{PATH}/save_params")
 os.makedirs(f"./results/experiments_sbi/exp{PATH}/fig")
 
 
-nb_posterior_sample = 10_000
+nb_posterior_sample = 1000
 num_chains = 20
 
 nb_simulations_allow_per_round = nb_simulations_allow // args.nb_round
