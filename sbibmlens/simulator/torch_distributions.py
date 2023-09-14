@@ -1,3 +1,4 @@
+import torch
 from torch.distributions import Normal
 
 # stuffs to re write the prior in pytorch

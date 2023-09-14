@@ -54,7 +54,7 @@ class PytorchCompressedSimulator:
 
 
 class PytorchPrior:
-    def __init__(self, device="cpu"):
+    def __init__(self, device='cpu'):
         self.device = device
         self.omega_c = TruncatedNormal(
             torch.tensor(0.2664, device=self.device), 0.2, low=0, device=self.device

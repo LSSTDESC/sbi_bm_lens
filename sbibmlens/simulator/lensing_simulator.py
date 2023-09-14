@@ -1,108 +1,277 @@
-import numpyro.distributions as dist
-import jax
-from sbi_lens.simulator.utils import get_samples_and_scores
-import jax
-import jax.numpy as jnp
-import numpy as np
-from tqdm import tqdm
+import argparse
+import csv
+import os
+import pickle
 from functools import partial
 
+import torch
+import haiku as hk
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from chainconsumer import ChainConsumer
+from haiku._src.nets.resnet import ResNet18
+from sbi_lens.config import config_lsst_y_10
 
-class CompressedSimulator:
-    def __init__(self, model, score_type, compressor, params_compressor, opt_state):
-        self.model = model
-        self.score_type = score_type
+from sbibmlens.utils import make_plot
+from sbi_lens.simulator.LogNormal_field import lensingLogNormal
+from sbi_lens.metrics.c2st import c2st
 
-        self.compressor = compressor
-        self.params_compressor = params_compressor
-        self.opt_state = opt_state
+from sbi.inference.base import infer
+from sbi.inference import SNPE_C, SNLE, SNRE, prepare_for_sbi, simulate_for_sbi
 
-        self.omega_c = dist.TruncatedNormal(0.2664, 0.2, low=0)
-        self.omega_b = dist.Normal(0.0492, 0.006)
-        self.sigma_8 = dist.Normal(0.831, 0.14)
-        self.h_0 = dist.Normal(0.6727, 0.063)
-        self.n_s = dist.Normal(0.9645, 0.08)
-        self.w_0 = dist.TruncatedNormal(-1.0, 0.9, low=-2.0, high=-0.3)
+from sbibmlens.simulator.torch_lensing_simulator import (
+    PytorchCompressedSimulator,
+    PytorchPrior,
+)
 
-        self.stack = [
-            self.omega_c,
-            self.omega_b,
-            self.sigma_8,
-            self.h_0,
-            self.n_s,
-            self.w_0,
-        ]
+gpus = tf.config.experimental.list_physical_devices(device_type="GPU")
 
-    def prior_sample(self, sample_shape, master_key):
-        samples = []
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
 
-        keys = jax.random.split(master_key, 6)
 
-        for i, distribution in enumerate(self.stack):
-            samples.append(distribution.sample(keys[i], sample_shape))
+# script arguments
+parser = argparse.ArgumentParser()
+parser.add_argument("--path_to_access_sbi_lens", type=str, default=".")
 
-        return jnp.stack(samples).T
+parser.add_argument("--sbi_method", type=str, default="snle")
+parser.add_argument("--nb_round", type=int, default=1)
 
-    def prior_log_prob(self, values):
-        logp = 0
+parser.add_argument("--exp_id", type=str, default="job_0")
 
-        for i, distribution in enumerate(self.stack):
-            logp += distribution.log_prob(values[..., i])
+parser.add_argument("--device", type=str, default="cpu")
 
-        return logp
+args = parser.parse_args()
 
-    @partial(jax.jit, static_argnums=(0,))
-    def simulator(self, theta, seed):
-        (_, simulation), score = get_samples_and_scores(
-            self.model,
-            seed,
-            batch_size=1,
-            score_type=self.score_type,
-            thetas=theta,
-            with_noise=True,
+
+######## PARAMS ########
+print("PARAMS---------------")
+print("---------------------")
+
+tmp = [100, 200, 300, 400, 600, 800, 1000, 1500, 2000]
+nb_simulations_allow = tmp[int(args.exp_id[4:])]
+
+
+print("simulation budget:", nb_simulations_allow)
+print("sbi method:", args.sbi_method)
+print("nb_round:", args.nb_round)
+
+print("---------------------")
+print("---------------------")
+
+PATH = "_{}_{}_{}".format(args.sbi_method, args.nb_round, nb_simulations_allow)
+
+os.makedirs(f"./results/experiments_sbi/exp{PATH}/save_params")
+os.makedirs(f"./results/experiments_sbi/exp{PATH}/fig")
+
+
+nb_posterior_sample = 1000
+num_chains = 20
+
+nb_simulations_allow_per_round = nb_simulations_allow // args.nb_round
+
+######## CONFIG LSST Y 10 ########
+print("... prepare config lsst year 10")
+
+# load lsst year 10 settings
+N = config_lsst_y_10.N
+map_size = config_lsst_y_10.map_size
+sigma_e = config_lsst_y_10.sigma_e
+gals_per_arcmin2 = config_lsst_y_10.gals_per_arcmin2
+nbins = config_lsst_y_10.nbins
+a = config_lsst_y_10.a
+b = config_lsst_y_10.b
+z0 = config_lsst_y_10.z0
+truth = config_lsst_y_10.truth
+params_name = config_lsst_y_10.params_name_latex
+
+
+# define lsst year 10 log normal model
+model = partial(
+    lensingLogNormal,
+    N=N,
+    map_size=map_size,
+    gal_per_arcmin2=gals_per_arcmin2,
+    sigma_e=sigma_e,
+    nbins=nbins,
+    a=a,
+    b=b,
+    z0=z0,
+    model_type="lognormal",
+    lognormal_shifts="LSSTY10",
+    with_noise=True,
+)
+
+
+# compressor
+compressor = hk.transform_with_state(lambda y: ResNet18(6)(y, is_training=False))
+
+a_file = open(
+    f"{args.path_to_access_sbi_lens}/sbi_lens/sbi_lens/data/params_compressor/opt_state_resnet_vmim.pkl",
+    "rb",
+)
+opt_state_resnet = pickle.load(a_file)
+
+a_file = open(
+    f"{args.path_to_access_sbi_lens}//sbi_lens/sbi_lens/data/params_compressor/params_nd_compressor_vmim.pkl",
+    "rb",
+)
+parameters_compressor = pickle.load(a_file)
+
+
+# observation
+m_data = np.load(
+    f"{args.path_to_access_sbi_lens}/sbi_lens/sbi_lens/data/m_data__256N_10ms_27gpa_0.26se.npy"
+)
+
+m_data_comressed, _ = compressor.apply(
+    parameters_compressor, opt_state_resnet, None, m_data.reshape([1, N, N, nbins])
+)
+
+observation = torch.tensor(np.array(m_data_comressed.squeeze()), device=args.device)
+
+
+# full field hmc contours (ground truth)
+sample_ff = np.load(
+    f"{args.path_to_access_sbi_lens}/sbi_lens/sbi_lens/data/posterior_full_field__256N_10ms_27gpa_0.26se.npy"
+)
+
+
+prior = PytorchPrior(device=args.device)
+simulator = PytorchCompressedSimulator(
+    model=model,
+    compressor=compressor,
+    params_compressor=parameters_compressor,
+    opt_state=opt_state_resnet,
+    device=args.device,
+).simulator
+
+simulator, prior = prepare_for_sbi(simulator, prior)
+
+proposal = prior
+
+posteriors = []
+
+
+if args.sbi_method == "snle":
+    inference = SNLE(prior=prior, device=args.device)
+
+    for _ in range(args.nb_round):
+        theta, x = simulate_for_sbi(
+            simulator, proposal, num_simulations=nb_simulations_allow_per_round
         )
+        density_estimator = inference.append_simulations(theta, x).train()
+        posterior = inference.build_posterior(density_estimator, mcmc_method="slice")
+        posteriors.append(posterior)
+        proposal = posterior.set_default_x(observation)
 
-        compressed_sim, _ = self.compressor.apply(
-            self.params_compressor, self.opt_state, None, simulation["y"]
+    posterior_sample = posterior.sample(
+        (nb_posterior_sample,),
+        x=observation,
+        method="slice_np_vectorized",
+        num_chains=num_chains,
+    )
+
+
+elif args.sbi_method == "snpe":
+    inference = SNPE_C(prior=prior, device=args.device)
+
+    for _ in range(args.nb_round):
+        theta, x = simulate_for_sbi(
+            simulator, proposal, num_simulations=nb_simulations_allow_per_round
         )
+        density_estimator = inference.append_simulations(
+            theta, x, proposal=proposal
+        ).train()
+        posterior = inference.build_posterior(density_estimator)
+        posteriors.append(posterior)
+        proposal = posterior.set_default_x(observation)
 
-        simulation["y"] = compressed_sim
-        simulation["score"] = score
+    posterior_sample = posterior.sample((nb_posterior_sample,), x=observation)
 
-        return simulation
 
-    def build_dataset(
-        self, batch_size, seed, use_prior=True, proposal_sample=None, simu_for_val=0
-    ):
-        print("... building dataset")
+elif args.sbi_method == "snre":
+    inference = SNRE(prior=prior, device=args.device)
 
-        batch_size += simu_for_val
-        new_batch_size = batch_size + batch_size // 5
-        keys = jax.random.split(seed, new_batch_size + 1)
+    for _ in range(args.nb_round):
+        theta, x = simulate_for_sbi(
+            simulator, proposal, num_simulations=nb_simulations_allow_per_round
+        )
+        density_estimator = inference.append_simulations(theta, x).train()
+        posterior = inference.build_posterior(density_estimator, mcmc_method="slice")
+        posteriors.append(posterior)
+        proposal = posterior.set_default_x(observation)
 
-        if use_prior:
-            theta_sample = self.prior_sample((new_batch_size,), keys[-1])
-        else:
-            inds = np.random.randint(0, len(proposal_sample), new_batch_size)
-            theta_sample = proposal_sample[inds]
+    posterior_sample = posterior.sample(
+        (nb_posterior_sample,),
+        x=observation,
+        method="slice_np_vectorized",
+        num_chains=num_chains,
+    )
 
-        data = {"theta": [], "y": [], "score": []}
 
-        for i, theta in enumerate(tqdm(theta_sample)):
-            data_tmp = self.simulator(theta.reshape([1, 6]), keys[i])
-            data["theta"].append(data_tmp["theta"].squeeze())
-            data["y"].append(data_tmp["y"].squeeze())
-            data["score"].append(data_tmp["score"].squeeze())
+jnp.save(
+    f"./results/experiments_sbi/exp{PATH}/posteriors_sample",
+    posterior_sample,
+)
 
-        data["theta"] = jnp.stack(data["theta"])
-        data["y"] = jnp.stack(data["y"])
-        data["score"] = jnp.stack(data["score"])
+make_plot(
+    [sample_ff, posterior_sample],
+    ["Ground truth", "Approx"],
+    params_name,
+    truth,
+)
 
-        inds = jnp.unique(jnp.where(jnp.isnan(data["score"]))[0])
-        data["y"] = jnp.delete(data["y"], inds, axis=0)[:batch_size]
-        data["score"] = jnp.delete(data["score"], inds, axis=0)[:batch_size]
-        data["theta"] = jnp.delete(data["theta"], inds, axis=0)[:batch_size]
+plt.savefig(f"./results/experiments_sbi/exp{PATH}/fig/contour_plot_round{0}")
 
-        print("... done ✓")
+print("done ✓")
 
-        return data
+print("... compute metric")
+
+if len(posterior_sample) > len(sample_ff):
+    nb_posterior_sample = len(sample_ff)
+else:
+    nb_posterior_sample = len(posterior_sample)
+
+inds = np.random.randint(0, nb_posterior_sample, 10_000)
+c2st_metric = c2st(sample_ff[inds], posterior_sample[inds], seed=0, n_folds=5)
+
+print("done ✓")
+
+print("... save info, params, etc.")
+
+# save params
+
+params_nde = inference.params
+with open(
+    f"./results/experiments_sbi/exp{PATH}/save_params/params_flow.pkl",
+    "wb",
+) as fp:
+    pickle.dump(params_nde, fp)
+
+
+print("done ✓")
+
+print("... save info experiment")
+
+field_names = ["experiment_id", "sbi_method", "nb_round", "nb_simulations", "c2st"]
+
+dict = {
+    "experiment_id": f"exp{PATH}",
+    "sbi_method": args.sbi_method,
+    "nb_round": args.nb_round,
+    "nb_simulations": nb_simulations_allow,
+    "c2st": c2st_metric,
+}
+
+with open(
+    "./results/store_experiments_sbi.csv",
+    "a",
+) as csv_file:
+    dict_object = csv.DictWriter(csv_file, fieldnames=field_names)
+    dict_object.writerow(dict)
+
+print("done ✓")
