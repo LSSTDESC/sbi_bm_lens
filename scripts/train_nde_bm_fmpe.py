@@ -34,6 +34,7 @@ from sbibmlens.utils import make_plot
 parser = argparse.ArgumentParser()
 parser.add_argument("--path_to_access_sbi_lens", type=str, default=".")
 parser.add_argument("--exp_id", type=str, default="job_0")
+parser.add_argument("--device", type=str, default="cpu")
 
 args = parser.parse_args()
 
