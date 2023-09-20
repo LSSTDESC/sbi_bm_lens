@@ -224,3 +224,16 @@ exp_snre_5_2000,snre,5,2000,0.6723
 exp_snre_5_1500,snre,5,1500,0.64515
 exp_snle_5_2000,snle,5,2000,0.592
 exp_snre_5_2000,snre,5,2000,0.66035
+exp_snpe_5_100,snpe,5,100,0.96625
+exp_snpe_1_500,snpe,1,500,0.7607
+exp_snpe_1_500,snpe,1,500,0.70585
+exp_snpe_5_500,snpe,5,500,0.62225
+exp_snpe_5_500,snpe,5,500,0.64705
+exp_snre_1_500,snre,1,500,0.93415
+exp_snre_1_500,snre,1,500,0.89045
+exp_snre_5_500,snre,5,500,0.8061
+exp_snpe_5_1000,snpe,5,1000,0.60565
+exp_snle_1_500,snle,1,500,0.6899
+exp_snle_1_500,snle,1,500,0.7649
+exp_snle_5_500,snle,5,500,0.6705
+exp_snle_5_500,snle,5,500,0.666
