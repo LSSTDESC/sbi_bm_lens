@@ -36,15 +36,9 @@ class PytorchCompressedSimulator:
 
         theta = jnp.array(theta).reshape([-1, 6])
 
-        is_nan = True
-        while is_nan:
-            random = int(np.random.randint(low=0, high=1e5, size=1))
-            key = jax.random.PRNGKey(random)
-            simulation = self._get_simulation(theta, key)
-            if jnp.isnan(simulation).all():
-                is_nan = True
-            else:
-                is_nan = False
+        random = int(np.random.randint(low=0, high=1e5, size=1))
+        key = jax.random.PRNGKey(random)
+        simulation = self._get_simulation(theta, key)
 
         compressed_sim, _ = self.compressor.apply(
             self.params_compressor, self.opt_state, None, simulation

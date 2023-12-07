@@ -4,37 +4,31 @@ import os
 import pickle
 from functools import partial
 
-import torch
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import lampe
 import matplotlib.pyplot as plt
 import numpy as np
-
-from chainconsumer import ChainConsumer
-from haiku._src.nets.resnet import ResNet18
-
-from sbi_lens.config import config_lsst_y_10
-from sbi_lens.simulator.LogNormal_field import lensingLogNormal
-from sbi_lens.metrics.c2st import c2st
-
-from lampe.inference import FMPE, FMPELoss
-from lampe.data import JointLoader
+import torch
 import torch.nn as nn
 import torch.optim as optim
+from haiku._src.nets.resnet import ResNet18
+from lampe.inference import FMPE, FMPELoss
 from lampe.utils import GDStep
-from itertools import islice
+from lensing_simulator_utils import JaxCompressedSimulator
+from sbi_lens.metrics.c2st import c2st
+from sbi_lens.simulator.config import config_lsst_y_10
+from sbi_lens.simulator.LogNormal_field import lensingLogNormal
 from tqdm import tqdm
-
-from sbibmlens.simulator.lensing_simulator import CompressedSimulator
-from sbibmlens.utils import make_plot
-
+from utils import make_plot
 
 # script arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--path_to_access_sbi_lens", type=str, default=".")
 parser.add_argument("--exp_id", type=str, default="job_0")
 parser.add_argument("--device", type=str, default="cpu")
+parser.add_argument("--seed", type=int, default=1)
 
 args = parser.parse_args()
 
@@ -43,7 +37,7 @@ args = parser.parse_args()
 print("PARAMS---------------")
 print("---------------------")
 
-tmp = [100, 200, 300, 400, 600, 800, 1000, 1500, 2000]
+tmp = [200, 500, 1000, 1500, 2000]
 nb_simulations_allow = tmp[int(args.exp_id[4:])]
 
 
@@ -52,7 +46,7 @@ print("simulation budget:", nb_simulations_allow)
 print("---------------------")
 print("---------------------")
 
-PATH = "_fmpe_{}".format(nb_simulations_allow)
+PATH = f"_fmpe_{nb_simulations_allow}_{args.seed}"
 
 os.makedirs(f"./results/experiments_sbi/exp{PATH}/save_params")
 os.makedirs(f"./results/experiments_sbi/exp{PATH}/fig")
@@ -139,7 +133,7 @@ print("done ✓")
 ######## BUILD DATASET ########
 print("... building dataset")
 
-compressed_simulator = CompressedSimulator(
+compressed_simulator = JaxCompressedSimulator(
     model=model,
     score_type="density",
     compressor=compressor,
@@ -161,7 +155,14 @@ print("done ✓")
 
 ######## TRAINING ########
 print("... training")
-estimator = FMPE(theta_dim=6, x_dim=6, hidden_features=[64] * 5, activation=nn.ELU)
+estimator = FMPE(
+    theta_dim=6,
+    x_dim=6,
+    hidden_features=[128] * 4,
+    activation=nn.ReLU,
+    freqs=5,
+    build=lampe.nn.ResMLP,
+)
 
 
 loss = FMPELoss(estimator)
@@ -223,6 +224,8 @@ print("done ✓")
 print("... save info experiment")
 
 field_names = ["experiment_id", "sbi_method", "nb_round", "nb_simulations", "c2st"]
+
+PATH = f"_fmpe_{nb_simulations_allow}"
 
 dict = {
     "experiment_id": f"exp{PATH}",

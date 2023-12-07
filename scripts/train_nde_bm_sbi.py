@@ -4,34 +4,21 @@ import os
 import pickle
 from functools import partial
 
-import torch
 import haiku as hk
-import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
-from chainconsumer import ChainConsumer
+import torch
 from haiku._src.nets.resnet import ResNet18
-from sbi_lens.config import config_lsst_y_10
-
-from sbibmlens.utils import make_plot
-from sbi_lens.simulator.LogNormal_field import lensingLogNormal
+from sbi.inference import SNLE, SNPE_C, SNRE, prepare_for_sbi, simulate_for_sbi
 from sbi_lens.metrics.c2st import c2st
-
-from sbi.inference.base import infer
-from sbi.inference import SNPE_C, SNLE, SNRE, prepare_for_sbi, simulate_for_sbi
-
-from sbibmlens.simulator.torch_lensing_simulator import (
+from sbi_lens.simulator.config import config_lsst_y_10
+from sbi_lens.simulator.LogNormal_field import lensingLogNormal
+from torch_lensing_simulator import (
     PytorchCompressedSimulator,
     PytorchPrior,
 )
-
-gpus = tf.config.experimental.list_physical_devices(device_type="GPU")
-
-for gpu in gpus:
-    tf.config.experimental.set_memory_growth(gpu, True)
-
+from utils import make_plot
 
 # script arguments
 parser = argparse.ArgumentParser()
@@ -39,6 +26,7 @@ parser.add_argument("--path_to_access_sbi_lens", type=str, default=".")
 
 parser.add_argument("--sbi_method", type=str, default="snle")
 parser.add_argument("--nb_round", type=int, default=1)
+parser.add_argument("--seed", type=int, default=1)
 
 parser.add_argument("--exp_id", type=str, default="job_0")
 
@@ -51,7 +39,7 @@ args = parser.parse_args()
 print("PARAMS---------------")
 print("---------------------")
 
-tmp = [100, 200, 300, 400, 600, 800, 1000, 1500, 2000]
+tmp = [200, 500, 1000, 1500, 2000]
 nb_simulations_allow = tmp[int(args.exp_id[4:])]
 
 
@@ -62,7 +50,9 @@ print("nb_round:", args.nb_round)
 print("---------------------")
 print("---------------------")
 
-PATH = "_{}_{}_{}".format(args.sbi_method, args.nb_round, nb_simulations_allow)
+PATH = "_{}_{}_{}_{}".format(
+    args.sbi_method, args.nb_round, nb_simulations_allow, args.seed
+)
 
 os.makedirs(f"./results/experiments_sbi/exp{PATH}/save_params")
 os.makedirs(f"./results/experiments_sbi/exp{PATH}/fig")
@@ -116,7 +106,7 @@ a_file = open(
 opt_state_resnet = pickle.load(a_file)
 
 a_file = open(
-    f"{args.path_to_access_sbi_lens}//sbi_lens/sbi_lens/data/params_compressor/params_nd_compressor_vmim.pkl",
+    f"{args.path_to_access_sbi_lens}/sbi_lens/sbi_lens/data/params_compressor/params_nd_compressor_vmim.pkl",
     "rb",
 )
 parameters_compressor = pickle.load(a_file)
@@ -153,19 +143,33 @@ simulator, prior = prepare_for_sbi(simulator, prior)
 
 proposal = prior
 
-posteriors = []
-
 
 if args.sbi_method == "snle":
     inference = SNLE(prior=prior, device=args.device)
 
     for _ in range(args.nb_round):
         theta, x = simulate_for_sbi(
-            simulator, proposal, num_simulations=nb_simulations_allow_per_round
+            simulator, proposal, num_simulations=nb_simulations_allow_per_round + 100
         )
+
+        # remove potential NaNs
+        inds = np.unique(np.where(torch.isnan(x).numpy())[0])
+        x = torch.tensor(np.delete(x.numpy(), inds, axis=0))
+        theta = torch.tensor(np.delete(theta.numpy(), inds, axis=0))
+
+        # select randomly nb_simulations_allow_per_round simulations
+        inds = np.random.randint(
+            low=0, high=x.shape[0], size=nb_simulations_allow_per_round
+        )
+        x = x[inds]
+        theta = theta[inds]
+
         density_estimator = inference.append_simulations(theta, x).train()
-        posterior = inference.build_posterior(density_estimator, mcmc_method="slice")
-        posteriors.append(posterior)
+        posterior = inference.build_posterior(
+            density_estimator,
+            mcmc_method="slice",
+            mcmc_parameters={"warmup_steps": 250},
+        )
         proposal = posterior.set_default_x(observation)
 
     posterior_sample = posterior.sample(
@@ -173,6 +177,7 @@ if args.sbi_method == "snle":
         x=observation,
         method="slice_np_vectorized",
         num_chains=num_chains,
+        mcmc_parameters={"warmup_steps": 250},
     )
 
 
@@ -181,13 +186,25 @@ elif args.sbi_method == "snpe":
 
     for _ in range(args.nb_round):
         theta, x = simulate_for_sbi(
-            simulator, proposal, num_simulations=nb_simulations_allow_per_round
+            simulator, proposal, num_simulations=nb_simulations_allow_per_round + 100
         )
+
+        # remove potential NaNs
+        inds = np.unique(np.where(torch.isnan(x).numpy())[0])
+        x = torch.tensor(np.delete(x.numpy(), inds, axis=0))
+        theta = torch.tensor(np.delete(theta.numpy(), inds, axis=0))
+
+        # select randomly nb_simulations_allow_per_round simulations
+        inds = np.random.randint(
+            low=0, high=x.shape[0], size=nb_simulations_allow_per_round
+        )
+        x = x[inds]
+        theta = theta[inds]
+
         density_estimator = inference.append_simulations(
             theta, x, proposal=proposal
-        ).train()
+        ).train(num_atoms=10)
         posterior = inference.build_posterior(density_estimator)
-        posteriors.append(posterior)
         proposal = posterior.set_default_x(observation)
 
     posterior_sample = posterior.sample((nb_posterior_sample,), x=observation)
@@ -198,11 +215,27 @@ elif args.sbi_method == "snre":
 
     for _ in range(args.nb_round):
         theta, x = simulate_for_sbi(
-            simulator, proposal, num_simulations=nb_simulations_allow_per_round
+            simulator, proposal, num_simulations=nb_simulations_allow_per_round + 100
         )
-        density_estimator = inference.append_simulations(theta, x).train()
-        posterior = inference.build_posterior(density_estimator, mcmc_method="slice")
-        posteriors.append(posterior)
+
+        # remove potential NaNs
+        inds = np.unique(np.where(torch.isnan(x).numpy())[0])
+        x = torch.tensor(np.delete(x.numpy(), inds, axis=0))
+        theta = torch.tensor(np.delete(theta.numpy(), inds, axis=0))
+
+        # select randomly nb_simulations_allow_per_round simulations
+        inds = np.random.randint(
+            low=0, high=x.shape[0], size=nb_simulations_allow_per_round
+        )
+        x = x[inds]
+        theta = theta[inds]
+
+        density_estimator = inference.append_simulations(theta, x).train(num_atoms=10)
+        posterior = inference.build_posterior(
+            density_estimator,
+            mcmc_method="slice",
+            mcmc_parameters={"warmup_steps": 250},
+        )
         proposal = posterior.set_default_x(observation)
 
     posterior_sample = posterior.sample(
@@ -210,8 +243,13 @@ elif args.sbi_method == "snre":
         x=observation,
         method="slice_np_vectorized",
         num_chains=num_chains,
+        mcmc_parameters={"warmup_steps": 250},
     )
 
+# check the number of simulations used by the algorithm
+# (should be equal to nb_simulations_allow_per_round * nb_round)
+theta, x, prior_masks = inference.get_simulations(starting_round=0)
+print("number of simulations used: ", theta.shape[0])
 
 posterior_sample = jnp.array(posterior_sample)
 jnp.save(

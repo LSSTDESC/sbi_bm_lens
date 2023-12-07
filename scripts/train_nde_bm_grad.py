@@ -15,19 +15,17 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from haiku._src.nets.resnet import ResNet18
 from sbi_lens.config import config_lsst_y_10
+from sbi_lens.metrics.c2st import c2st
 from sbi_lens.normflow.models import (
-    AffineSigmoidCoupling,
     AffineCoupling,
+    AffineSigmoidCoupling,
     ConditionalRealNVP,
 )
-
-from sbibmlens.nn import MomentNetwork
-from sbibmlens.inference.snle import SNLE
-from sbibmlens.utils import make_plot
-from sbibmlens.simulator.lensing_simulator import CompressedSimulator
-
 from sbi_lens.simulator.LogNormal_field import lensingLogNormal
-from sbi_lens.metrics.c2st import c2st
+from sbibmlens.inference.snle import SNLE
+from sbibmlens.nn import MomentNetwork
+from sbibmlens.simulator.lensing_simulator import CompressedSimulator
+from sbibmlens.utils import make_plot
 
 tfp = tfp.experimental.substrates.jax
 tfb = tfp.bijectors

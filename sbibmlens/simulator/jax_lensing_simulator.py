@@ -8,7 +8,7 @@ from tqdm import tqdm
 from functools import partial
 
 
-class CompressedSimulator:
+class JaxCompressedSimulator:
     def __init__(self, model, score_type, compressor, params_compressor, opt_state):
         self.model = model
         self.score_type = score_type
